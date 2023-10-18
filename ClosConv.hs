@@ -3,6 +3,8 @@
 {-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -Wall #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeAbstractions #-}
 
 -- Closure conversion
 
@@ -10,7 +12,7 @@
 -- normal De Bruijn representation to one where lambdas explicitly store their
 -- free variables.
 
-module ClosConv (close) where
+module ClosConv (DB (..), DB' (..), close, Fun (..), conv) where
 
 import Data.Proxy
 import Data.Type.Equality
@@ -77,11 +79,11 @@ hAppend (HCons x xs) ys = HCons x (hAppend xs ys)
 weaken' :: DB' env a -> DB' (x : env) a
 weaken' = weakenUnder' HNil (HCons Proxy HNil) Proxy
 
-weakenUnderVar :: HList Proxy pre -> HList Proxy new -> Proxy env -> Var (pre ++ env) a -> Var (pre ++ (new ++ env)) a
-weakenUnderVar HCons {} _ _ VZ = VZ
-weakenUnderVar (HCons Proxy pre) new env (VS x) = VS (weakenUnderVar pre new env x)
-weakenUnderVar HNil HNil _ x = x
-weakenUnderVar HNil (HCons Proxy new) env x = VS (weakenUnderVar HNil new env x)
+weakenVar :: HList Proxy pre -> HList Proxy new -> Proxy env -> Var (pre ++ env) a -> Var (pre ++ (new ++ env)) a
+weakenVar HCons {} _ _ VZ = VZ
+weakenVar (HCons Proxy pre) new env (VS x) = VS (weakenVar pre new env x)
+weakenVar HNil HNil _ x = x
+weakenVar HNil (HCons Proxy new) env x = VS (weakenVar HNil new env x)
 
 weakenUnderSel :: HList Proxy pre -> HList Proxy new -> Proxy env -> Sel (pre ++ env) env' -> Sel (pre ++ (new ++ env)) env'
 weakenUnderSel HCons {} _ _ Done = Done
@@ -91,7 +93,7 @@ weakenUnderSel HNil HNil _ x = x
 weakenUnderSel HNil (HCons Proxy new) env x = Drop (weakenUnderSel HNil new env x)
 
 weakenUnder' :: HList Proxy pre -> HList Proxy new -> Proxy env -> DB' (pre ++ env) a -> DB' (pre ++ (new ++ env)) a
-weakenUnder' pre new env (Var' v) = Var' (weakenUnderVar pre new env v)
+weakenUnder' pre new env (Var' v) = Var' (weakenVar pre new env v)
 weakenUnder' pre new env (App' x y) = App' (weakenUnder' pre new env x) (weakenUnder' pre new env y)
 weakenUnder' pre new env (Lam' s x) = Lam' (minimize (weakenUnderSel pre new env s)) x
 
@@ -156,13 +158,107 @@ closeApp pre (ClosResult hx sx x) (ClosResult HNil Done y) =
     Refl ->
       ClosResult hx sx (App' x (weakenUnder' pre hx (Proxy @'[]) y))
 
--- data Fun env a b where
---   Glo :: _ env a b -> Fun env a b
---   Id :: Fun env a a
---   Compose :: Fun env b c -> Fun env a b -> Fun env a c
---
--- conv :: ClosResult '[] '[] a -> (HList _ g, Var g a)
--- conv = _
+data Fun fun var a where
+  Fn :: Fun fun var ctx -> Var fun ((a,ctx) -> b) -> Fun fun var (a -> b)
+  Vr :: Fun fun var var
+  Ap :: Fun fun var (a -> b) -> Fun fun var a -> Fun fun var b
+
+  Tp :: Fun fun var a -> Fun fun var b -> Fun fun var (a, b)
+  P1 :: Fun fun var ((a, b) -> a)
+  P2 :: Fun fun var ((a, b) -> b)
+  U  :: Fun fun var ()
+
+deriving instance Show (Fun fun var a)
+
+data TopLevel fun a where
+  TopLevel :: Fun fun var b -> TopLevel fun (var -> b)
+
+deriving instance Show (TopLevel fun a)
+
+lookupHList :: Var env a -> HList f env -> f a
+lookupHList VZ (HCons x _) = x
+lookupHList (VS v) (HCons _ xs) = lookupHList v xs
+
+selectHList :: Sel env env' -> HList f env -> HList f env'
+selectHList Done _ = HNil
+selectHList (Keep s) (HCons x xs) = HCons x (selectHList s xs)
+selectHList (Drop s) (HCons _ xs) = selectHList s xs
+
+type family Unroll xs where
+  Unroll '[] = ()
+  Unroll (x : xs) = (x, Unroll xs)
+
+pVar :: HList Proxy pre -> Var env b -> Fun fun (Unroll (pre ++ env)) (Unroll env) -> Fun fun (Unroll (pre ++ env)) b 
+pVar _ VZ x = Ap P1 x
+pVar h (VS @env' @_ @x v) x = 
+  case assoc h (Proxy @'[x]) (Proxy @env') of 
+    Refl ->
+      pVar (hAppend h (HCons (Proxy @x) HNil)) v (Ap P2 x)
+
+data ConvResult var a where
+  ConvResult :: HList (TopLevel fun) fun -> Fun fun var a -> ConvResult var a
+
+deriving instance Show (ConvResult var a)
+
+weakenFun :: HList Proxy pre -> HList Proxy new -> Proxy fun -> Fun (pre ++ fun) var a -> Fun (pre ++ (new ++ fun)) var a
+weakenFun h1 h2 p3 = \case
+  Fn ctx x -> Fn (weakenFun h1 h2 p3 ctx) (weakenVar h1 h2 p3 x)
+  Vr -> Vr
+  Ap x y -> Ap (weakenFun h1 h2 p3 x) (weakenFun h1 h2 p3 y)
+  Tp x y -> Tp (weakenFun h1 h2 p3 x) (weakenFun h1 h2 p3 y)
+  P1 -> P1
+  P2 -> P2
+  U -> U
+
+weakenTopLevel :: HList Proxy pre -> HList Proxy new -> Proxy fun -> TopLevel (pre ++ fun) a -> TopLevel (pre ++ (new ++ fun)) a
+weakenTopLevel p1 p2 p3 (TopLevel x) = TopLevel (weakenFun p1 p2 p3 x)
+
+hmap :: (forall x. f x -> f' x) -> HList f xs -> HList f' xs
+hmap _ HNil = HNil
+hmap f (HCons x xs) = HCons (f x) (hmap f xs)
+
+unselect :: Sel env env' -> Var env' a -> Var env a
+unselect (Drop s) v = VS (unselect s v)
+unselect (Keep s) (VS v) = VS (unselect s v)
+unselect Keep{} VZ = VZ
+unselect Done v = case v of {}
+
+funVar :: Var env a -> Fun fun var (Unroll env) -> Fun fun var a
+funVar VZ x = Ap P1 x
+funVar (VS v) x = funVar v (Ap P2 x)
+
+funSel :: Sel env env' -> Fun fun var (Unroll env) -> Fun fun var (Unroll env')
+funSel Done _ = U
+funSel (Keep s) x = Tp (Ap P1 x) (funSel s (Ap P2 x))
+funSel (Drop s) x = funSel s (Ap P2 x)
+
+conv :: DB' env a -> ConvResult (Unroll env) a
+conv (Var' v) = ConvResult HNil (funVar v Vr)
+conv (Lam' s x) =
+  case conv x of
+    ConvResult h x' ->
+      let h' = hmap (weakenTopLevel HNil (HCons Proxy HNil) Proxy) (HCons (TopLevel x') h) in
+      ConvResult h' (Fn (funSel s Vr) VZ)
+conv (App' x y) = 
+  case conv x of
+    ConvResult @funx hx x' ->
+      case conv y of
+        ConvResult @funy hy y' ->
+          let hpx = hmap (const Proxy) hx
+              hpy = hmap (const Proxy) hy
+          in
+          case (rightId (hmap (const Proxy) hx), rightId (hmap (const Proxy) hy)) of 
+            (Refl, Refl) -> 
+              ConvResult 
+                (hAppend
+                  (hmap (weakenTopLevel hpx hpy (Proxy @'[])) hx)
+                  (hmap (weakenTopLevel HNil hpx (Proxy @funy)) hy)
+                )
+                (Ap
+                  (weakenFun hpx hpy (Proxy @'[]) x') 
+                  (weakenFun HNil hpx (Proxy @funy) y')
+                )
+
 
 infixl `App`
 
@@ -176,6 +272,7 @@ pred =
 -- ClosResult HNil Done (Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done)) (App' (App' (App' (Var' (VS (VS VZ))) (Lam' (Drop (Keep Done)) (Lam' (Keep (Keep Done)) (App' (Var' VZ) (App' (Var' (VS VZ)) (Var' (VS (VS VZ)))))))) (Lam' (Keep Done) (Var' (VS VZ)))) (Lam' Done (Var' VZ))))))
 
 
+pred' :: DB' '[] ((((a1 -> a2) -> (a2 -> b1) -> b1)     -> (a3 -> b2) -> (b3 -> b3) -> b4)    -> a1 -> b2 -> b4)
 pred' = Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done))
   (App' (App' (App' (Var' (VS (VS VZ)))
                     (Lam' (Drop (Keep Done)) (Lam' (Keep (Keep Done)) (App' (Var' VZ) (App' (Var' (VS VZ)) (Var' (VS (VS VZ))))))))
@@ -189,3 +286,6 @@ pred' = Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done))
 --                           (Lam' (Drop (Keep (Drop Done))) (Lam' (Keep (Keep Done)) (App' (Var' VZ) (App' (Var' (VS VZ)) (Var' (VS (VS VZ))))))))
 --                     (Lam' (Keep (Drop (Drop Done))) (Var' (VS VZ))))
 --               (Lam' (Drop (Drop (Drop Done))) (Var' VZ))))))
+
+-- >>> conv pred'
+-- ConvResult (HCons (TopLevel (Fn (Tp (Ap P1 Vr) U) (VS VZ))) (HCons (TopLevel (Fn (Tp (Ap P1 Vr) (Tp (Ap P1 (Ap P2 Vr)) U)) (VS (VS VZ)))) (HCons (TopLevel (Ap (Ap (Ap (Ap P1 (Ap P2 (Ap P2 Vr))) (Fn (Tp (Ap P1 (Ap P2 Vr)) U) (VS (VS (VS VZ))))) (Fn (Tp (Ap P1 Vr) U) (VS (VS (VS (VS (VS VZ))))))) (Fn U (VS (VS (VS (VS (VS (VS VZ))))))))) (HCons (TopLevel (Fn (Tp (Ap P1 Vr) (Tp (Ap P1 (Ap P2 Vr)) U)) (VS (VS (VS (VS VZ)))))) (HCons (TopLevel (Ap (Ap P1 Vr) (Ap (Ap P1 (Ap P2 Vr)) (Ap P1 (Ap P2 (Ap P2 Vr)))))) (HCons (TopLevel (Ap P1 (Ap P2 Vr))) (HCons (TopLevel (Ap P1 Vr)) HNil))))))) (Fn U VZ)
