@@ -12,11 +12,12 @@
 -- normal De Bruijn representation to one where lambdas explicitly store their
 -- free variables.
 
-module ClosConv (DB (..), DB' (..), close, Fun (..), conv) where
+module ClosConv (DB (..), Fun (..), closureConvert) where
 
 import Data.Proxy
 import Data.Type.Equality
 import Data.Functor.Identity
+import Data.Kind
 
 data Var env a where
   VZ :: Var (a : env) a
@@ -167,8 +168,11 @@ closeApp pre (ClosResult hx sx x) (ClosResult HNil Done y) =
     Refl ->
       ClosResult hx sx (App' x (weakenUnder' pre hx (Proxy @'[]) y))
 
+type FunType :: [Type] -> Type -> Type -> Type
+data FunType ctx a b
+
 data Fun fun var a where
-  Fn :: Fun fun var (HList Identity ctx) -> Var fun (HList Identity (a : ctx) -> b) -> Fun fun var (a -> b)
+  Fn :: Fun fun var (HList Identity ctx) -> Var fun (FunType ctx a b) -> Fun fun var (a -> b)
   Vr :: Fun fun var var
   (:$) :: Fun fun var (a -> b) -> Fun fun var a -> Fun fun var b
 
@@ -180,18 +184,9 @@ deriving instance Show (Fun fun var a)
 infixl 1 :$
 
 data TopLevel fun a where
-  TopLevel :: Fun fun var b -> TopLevel fun (var -> b)
+  TopLevel :: Fun fun (HList Identity (a : ctx)) b -> TopLevel fun (FunType ctx a b)
 
 deriving instance Show (TopLevel fun a)
-
-lookupHList :: Var env a -> HList f env -> f a
-lookupHList VZ (HCons x _) = x
-lookupHList (VS v) (HCons _ xs) = lookupHList v xs
-
-selectHList :: Sel env env' -> HList f env -> HList f env'
-selectHList Done _ = HNil
-selectHList (Keep s) (HCons x xs) = HCons x (selectHList s xs)
-selectHList (Drop s) (HCons _ xs) = selectHList s xs
 
 data ConvResult var a where
   ConvResult :: HList (TopLevel fun) fun -> Fun fun var a -> ConvResult var a
@@ -212,12 +207,6 @@ weakenTopLevel p1 p2 p3 (TopLevel x) = TopLevel (weakenFun p1 p2 p3 x)
 hmap :: (forall x. f x -> f' x) -> HList f xs -> HList f' xs
 hmap _ HNil = HNil
 hmap f (HCons x xs) = HCons (f x) (hmap f xs)
-
-unselect :: Sel env env' -> Var env' a -> Var env a
-unselect (Drop s) v = VS (unselect s v)
-unselect (Keep s) (VS v) = VS (unselect s v)
-unselect Keep{} VZ = VZ
-unselect Done v = case v of {}
 
 funSel :: Sel env env' -> Fun fun var (HList Identity env) -> Fun fun var (HList Identity env')
 funSel s0 x0 = Tp (go HNil s0 x0) where
@@ -262,6 +251,9 @@ conv (App' x y) =
                 )
                 (weakenFun hpx hpy (Proxy @'[]) x' :$ weakenFun HNil hpx (Proxy @funy) y')
 
+closureConvert :: DB '[] a -> ConvResult (HList Identity '[]) a
+closureConvert x = case close x of ClosResult _ Done y -> conv y
+
 infixl `App`
 
 pred =
@@ -274,15 +266,14 @@ pred =
 -- ClosResult HNil Done (Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done)) (App' (App' (App' (Var' (VS (VS VZ))) (Lam' (Drop (Keep Done)) (Lam' (Keep (Keep Done)) (App' (Var' VZ) (App' (Var' (VS VZ)) (Var' (VS (VS VZ)))))))) (Lam' (Keep Done) (Var' (VS VZ)))) (Lam' Done (Var' VZ))))))
 
 
-
-pred' :: DB' '[] ((((a1 -> a2) -> (a2 -> b1) -> b1)     -> (a3 -> b2) -> (b3 -> b3) -> b4)    -> a1 -> b2 -> b4)
+pred' :: DB' '[] ((((a1 -> a2) -> (a2 -> b1) -> b1) -> (a3 -> b2) -> (b3 -> b3) -> b4) -> a1 -> b2 -> b4)
 pred' = Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done))
   (App' (App' (App' (Var' (VS (VS VZ)))
                     (Lam' (Drop (Keep Done)) (Lam' (Keep (Keep Done)) (App' (Var' VZ) (App' (Var' (VS VZ)) (Var' (VS (VS VZ))))))))
               (Lam' (Keep Done) (Var' (VS VZ))))
         (Lam' Done (Var' VZ)))))
 
--- without minimization:
+-- Without Sel minimization:
 --
 -- pred' = (Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done))
 --         (App' (App' (App' (Var' (VS (VS VZ)))
@@ -294,15 +285,15 @@ pred' = Lam' Done (Lam' (Keep Done) (Lam' (Keep (Keep Done))
 -- ConvResult (HCons (TopLevel (Fn (Tp (HCons (Pr 0 Vr) HNil)) 1)) (HCons (TopLevel (Fn (Tp (HCons (Pr 0 Vr) (HCons (Pr 1 Vr) HNil))) 2)) (HCons (TopLevel (((Pr 2 Vr :$ Fn (Tp (HCons (Pr 1 Vr) HNil)) 3) :$ Fn (Tp (HCons (Pr 0 Vr) HNil)) 5) :$ Fn (Tp HNil) 6)) (HCons (TopLevel (Fn (Tp (HCons (Pr 0 Vr) (HCons (Pr 1 Vr) HNil))) 4)) (HCons (TopLevel (Pr 0 Vr :$ (Pr 1 Vr :$ Pr 2 Vr))) (HCons (TopLevel (Pr 1 Vr)) (HCons (TopLevel (Pr 0 Vr)) HNil))))))) (Fn (Tp HNil) 0)
 
 -- ConvResult
---   0 (TopLevel (Fn (Pr 0 Vr) 1))                      \{}    n -> f1
---   1 (TopLevel (Fn (Pr 0 Vr, Pr 1 Vr) 2))             \{n}   f -> f2
---   2 (TopLevel                                        \{n f} x -> n f3 f5 f6
+--   0 (TopLevel (Fn (Pr 0 Vr) 1))                      \{}    n -> f1{n}
+--   1 (TopLevel (Fn (Pr 0 Vr, Pr 1 Vr) 2))             \{n}   f -> f2{n f}
+--   2 (TopLevel                                        \{n f} x -> n f3{f} f5{x} f6{}
 --        (Pr 2 Vr :$ Fn (Pr 1 Vr) 3
 --                 :$ Fn (Pr 0 Vr) 5
 --                 :$ Fn () 6
 --        )
 --     )
---   3 (TopLevel (Fn (Pr 0 Vr, Pr 1 Vr) 4))             \{f}   g -> f4
+--   3 (TopLevel (Fn (Pr 0 Vr, Pr 1 Vr) 4))             \{f}   g -> f4{g f}
 --   4 (TopLevel (Pr 0 Vr :$ (Pr 1 Vr :$ Pr 2 Vr)))     \{g f} h -> h (g f)
 --   5 (TopLevel (Pr 1 Vr))                             \{x}   u -> x
 --   6 (TopLevel (Pr 0 Vr))                             \{}    u -> u
