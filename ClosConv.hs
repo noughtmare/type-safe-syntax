@@ -16,6 +16,7 @@ module ClosConv (DB (..), DB' (..), close, Fun (..), conv) where
 
 import Data.Proxy
 import Data.Type.Equality
+import Data.Functor.Identity
 
 data Var env a where
   VZ :: Var (a : env) a
@@ -159,14 +160,12 @@ closeApp pre (ClosResult hx sx x) (ClosResult HNil Done y) =
       ClosResult hx sx (App' x (weakenUnder' pre hx (Proxy @'[]) y))
 
 data Fun fun var a where
-  Fn :: Fun fun var ctx -> Var fun ((a,ctx) -> b) -> Fun fun var (a -> b)
+  Fn :: Fun fun var (HList Identity ctx) -> Var fun (HList Identity (a : ctx) -> b) -> Fun fun var (a -> b)
   Vr :: Fun fun var var
   Ap :: Fun fun var (a -> b) -> Fun fun var a -> Fun fun var b
 
-  Tp :: Fun fun var a -> Fun fun var b -> Fun fun var (a, b)
-  P1 :: Fun fun var ((a, b) -> a)
-  P2 :: Fun fun var ((a, b) -> b)
-  U  :: Fun fun var ()
+  Tp :: HList (Fun fun var) xs -> Fun fun var (HList Identity xs)
+  Pr :: Var xs a -> Fun fun var (HList Identity xs) -> Fun fun var a
 
 deriving instance Show (Fun fun var a)
 
@@ -188,12 +187,12 @@ type family Unroll xs where
   Unroll '[] = ()
   Unroll (x : xs) = (x, Unroll xs)
 
-pVar :: HList Proxy pre -> Var env b -> Fun fun (Unroll (pre ++ env)) (Unroll env) -> Fun fun (Unroll (pre ++ env)) b 
-pVar _ VZ x = Ap P1 x
-pVar h (VS @env' @_ @x v) x = 
-  case assoc h (Proxy @'[x]) (Proxy @env') of 
-    Refl ->
-      pVar (hAppend h (HCons (Proxy @x) HNil)) v (Ap P2 x)
+-- pVar :: HList Proxy pre -> Var env b -> Fun fun (Unroll (pre ++ env)) (Unroll env) -> Fun fun (Unroll (pre ++ env)) b 
+-- pVar _ VZ x = Ap P1 x
+-- pVar h (VS @env' @_ @x v) x = 
+--   case assoc h (Proxy @'[x]) (Proxy @env') of 
+--     Refl ->
+--       pVar (hAppend h (HCons (Proxy @x) HNil)) v (Ap P2 x)
 
 data ConvResult var a where
   ConvResult :: HList (TopLevel fun) fun -> Fun fun var a -> ConvResult var a
@@ -205,10 +204,8 @@ weakenFun h1 h2 p3 = \case
   Fn ctx x -> Fn (weakenFun h1 h2 p3 ctx) (weakenVar h1 h2 p3 x)
   Vr -> Vr
   Ap x y -> Ap (weakenFun h1 h2 p3 x) (weakenFun h1 h2 p3 y)
-  Tp x y -> Tp (weakenFun h1 h2 p3 x) (weakenFun h1 h2 p3 y)
-  P1 -> P1
-  P2 -> P2
-  U -> U
+  Tp x -> Tp (hmap (weakenFun h1 h2 p3) x)
+  Pr v x -> Pr v (weakenFun h1 h2 p3 x)
 
 weakenTopLevel :: HList Proxy pre -> HList Proxy new -> Proxy fun -> TopLevel (pre ++ fun) a -> TopLevel (pre ++ (new ++ fun)) a
 weakenTopLevel p1 p2 p3 (TopLevel x) = TopLevel (weakenFun p1 p2 p3 x)
@@ -223,22 +220,24 @@ unselect (Keep s) (VS v) = VS (unselect s v)
 unselect Keep{} VZ = VZ
 unselect Done v = case v of {}
 
-funVar :: Var env a -> Fun fun var (Unroll env) -> Fun fun var a
-funVar VZ x = Ap P1 x
-funVar (VS v) x = funVar v (Ap P2 x)
+-- funVar :: Var env a -> Fun fun var (Unroll env) -> Fun fun var a
+-- funVar VZ x = Ap P1 x
+-- funVar (VS v) x = funVar v (Ap P2 x)
 
-funSel :: Sel env env' -> Fun fun var (Unroll env) -> Fun fun var (Unroll env')
-funSel Done _ = U
-funSel (Keep s) x = Tp (Ap P1 x) (funSel s (Ap P2 x))
-funSel (Drop s) x = funSel s (Ap P2 x)
+funSel :: Sel env env' -> Fun fun var (HList Identity env) -> Fun fun var (HList Identity env')
+funSel s x = Tp (go (Proxy @'[]) VZ s x) where
+  go :: Proxy pre -> Var (pre ++ (a : env)) a -> Sel env env' -> Fun fun var (HList Identity (pre ++ env)) -> HList (Fun fun var) env'
+  go Proxy v Done _ = HNil
+  go Proxy v (Keep s) x = HCons (Pr v x) (go Proxy (VS v) s x)
+  go Proxy v (Drop s) x = go (VS v) s x
 
-conv :: DB' env a -> ConvResult (Unroll env) a
-conv (Var' v) = ConvResult HNil (funVar v Vr)
+conv :: DB' env a -> ConvResult (HList Identity env) a
+conv (Var' v) = ConvResult HNil (Pr v Vr)
 conv (Lam' s x) =
   case conv x of
     ConvResult h x' ->
       let h' = hmap (weakenTopLevel HNil (HCons Proxy HNil) Proxy) (HCons (TopLevel x') h) in
-      ConvResult h' (Fn (funSel s Vr) VZ)
+      ConvResult h' (Fn (_funSel s Vr) VZ)
 conv (App' x y) = 
   case conv x of
     ConvResult @funx hx x' ->
